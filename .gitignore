@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Coverage files
+.coverage
+htmlcov/
+
+# Uvicorn logs
+/tmp/uvicorn.log
+
+# OS files
+.DS_Store

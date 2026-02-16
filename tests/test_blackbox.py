@@ -51,6 +51,13 @@ def test_auth_token_kid_exists_in_jwks():
     assert hdr["kid"] in kids
 
 
+def test_auth_expired_param_present_works():
+    # Spec says: if "expired" query param is present, issue expired JWT
+    token = client.post("/auth?expired").json()["token"]
+    claims = jwt.decode(token, options={"verify_signature": False, "verify_exp": False})
+    assert claims["exp"] < int(time.time())
+
+
 def test_auth_expired_uses_expired_key_and_expired_exp():
     token = client.post("/auth?expired=true").json()["token"]
     hdr = _jwt_header(token)
