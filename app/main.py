@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import FastAPI, Query
+from fastapi import Body, FastAPI, Query
 from fastapi.responses import JSONResponse
 
-from .keys import KeyStore
 from .jwt_service import issue_token
+from .keys import KeyStore
 
-app = FastAPI(title="JWKS Server", version="1.0.2")
+app = FastAPI(title="JWKS Server", version="2.0.0")
 
 KEYS = KeyStore.with_demo_keys()
 
@@ -24,8 +24,10 @@ def jwks_well_known():
 
 
 @app.post("/auth")
-def auth(expired: Optional[str] = Query(default=None)):
-    # Treat presence of ?expired as True (supports /auth?expired and /auth?expired=true)
+def auth(
+    expired: Optional[str] = Query(default=None),
+    body: Optional[dict] = Body(default=None)
+):
     use_expired = expired is not None
 
     try:
@@ -33,8 +35,5 @@ def auth(expired: Optional[str] = Query(default=None)):
     except ValueError as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-    token, _claims = issue_token(signing_key=signing_key, expired=use_expired)
-
-    # Gradebot explicitly checks raw, JSON["jwt"], and JSON["token"].
-    # Return the JWT in the most standard key: "jwt".
-    return {"jwt": token, "token": token}
+    token, claims = issue_token(signing_key=signing_key, expired=use_expired)
+    return {"jwt": token, "token": token, "claims": claims}
