@@ -2,22 +2,26 @@ from __future__ import annotations
 
 import base64
 import sqlite3
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .models import KeyRecord
 
 DB_FILE = "totally_not_my_privateKeys.db"
 
+AES_KEY = os.getenv("NOT_MY_KEY")
+if AES_KEY is None:
+    raise RuntimeError("NOT_MY_KEY not set")
+AES_KEY = AES_KEY.encode().ljust(32, b'\0')[:32]
+
 
 def _b64url_uint(n: int) -> str:
-    if n == 0:
-        raw = b"\x00"
-    else:
-        raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+    raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
     return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
 
 
@@ -39,133 +43,115 @@ class KeyStore:
         self._init_db()
         self._clear_keys()
 
-    @staticmethod
-    def now() -> datetime:
-        return datetime.now(timezone.utc)
-
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self):
         return sqlite3.connect(self.db_file)
 
-    def _init_db(self) -> None:
+    def _init_db(self):
         conn = self._connect()
-        cursor = conn.cursor()
-        cursor.execute("""
+        c = conn.cursor()
+
+        c.execute("""
         CREATE TABLE IF NOT EXISTS keys(
             kid INTEGER PRIMARY KEY AUTOINCREMENT,
             key BLOB NOT NULL,
             exp INTEGER NOT NULL
         )
         """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            password_hash TEXT,
+            email TEXT,
+            date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP
+        )
+        """)
+
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS auth_logs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_ip TEXT,
+            request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            user_id INTEGER
+        )
+        """)
+
         conn.commit()
         conn.close()
 
-    def _clear_keys(self) -> None:
+    def _clear_keys(self):
         conn = self._connect()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM keys")
+        conn.execute("DELETE FROM keys")
         conn.commit()
         conn.close()
 
-    def _generate_private_key(self) -> rsa.RSAPrivateKey:
+    def _generate_private_key(self):
         return rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
-    def add_rsa_key(self, expires_at: datetime) -> KeyRecord:
+    def add_rsa_key(self, expires_at: datetime):
         private_key = self._generate_private_key()
 
-        pem = private_key.private_bytes(
+        raw_pem = private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption(),
         )
 
-        exp_ts = int(expires_at.timestamp())
+        aesgcm = AESGCM(AES_KEY)
+        nonce = os.urandom(12)
+        encrypted = nonce + aesgcm.encrypt(nonce, raw_pem, None)
 
         conn = self._connect()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO keys (key, exp) VALUES (?, ?)",
-            (pem, exp_ts),
-        )
-        kid = cursor.lastrowid
+        c = conn.cursor()
+        c.execute("INSERT INTO keys (key, exp) VALUES (?, ?)",
+                  (encrypted, int(expires_at.timestamp())))
+        kid = c.lastrowid
         conn.commit()
         conn.close()
 
-        kid_str = str(kid)
-        jwk = _public_jwk_from_private(kid_str, private_key)
+        return self._row_to_keyrecord(kid, encrypted, int(expires_at.timestamp()))
+
+    def _row_to_keyrecord(self, kid, pem, exp):
+        aesgcm = AESGCM(AES_KEY)
+        nonce = pem[:12]
+        decrypted = aesgcm.decrypt(nonce, pem[12:], None)
+
+        private_key = serialization.load_pem_private_key(decrypted, password=None)
 
         return KeyRecord(
-            kid=kid_str,
+            kid=str(kid),
             private_key=private_key,
-            public_jwk=jwk,
-            expires_at=expires_at,
+            public_jwk=_public_jwk_from_private(str(kid), private_key),
+            expires_at=datetime.fromtimestamp(exp, tz=timezone.utc),
         )
 
-    def _row_to_keyrecord(self, kid: int, pem: bytes, exp: int) -> KeyRecord:
-        private_key = serialization.load_pem_private_key(pem, password=None)
-        kid_str = str(kid)
-        jwk = _public_jwk_from_private(kid_str, private_key)
-        expires_at = datetime.fromtimestamp(exp, tz=timezone.utc)
-
-        return KeyRecord(
-            kid=kid_str,
-            private_key=private_key,
-            public_jwk=jwk,
-            expires_at=expires_at,
-        )
-
-    def get_unexpired_public_jwks(self, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
-        now = now or self.now()
-        now_ts = int(now.timestamp())
+    def get_unexpired_public_jwks(self):
+        now = int(datetime.now(timezone.utc).timestamp())
 
         conn = self._connect()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT kid, key, exp FROM keys WHERE exp > ? ORDER BY exp DESC",
-            (now_ts,),
-        )
-        rows = cursor.fetchall()
+        rows = conn.execute("SELECT kid,key,exp FROM keys WHERE exp>?", (now,)).fetchall()
         conn.close()
 
-        jwks: List[Dict[str, Any]] = []
-        for kid, pem, exp in rows:
-            record = self._row_to_keyrecord(kid, pem, exp)
-            jwks.append(record.public_jwk)
+        return [self._row_to_keyrecord(*r).public_jwk for r in rows]
 
-        return jwks
-
-    def get_best_signing_key(self, expired: bool, now: Optional[datetime] = None) -> KeyRecord:
-        now = now or self.now()
-        now_ts = int(now.timestamp())
+    def get_best_signing_key(self, expired: bool):
+        now = int(datetime.now(timezone.utc).timestamp())
 
         conn = self._connect()
-        cursor = conn.cursor()
-
         if expired:
-            cursor.execute(
-                "SELECT kid, key, exp FROM keys WHERE exp <= ? ORDER BY exp DESC LIMIT 1",
-                (now_ts,),
-            )
+            row = conn.execute("SELECT kid,key,exp FROM keys WHERE exp<=? LIMIT 1", (now,)).fetchone()
         else:
-            cursor.execute(
-                "SELECT kid, key, exp FROM keys WHERE exp > ? ORDER BY exp DESC LIMIT 1",
-                (now_ts,),
-            )
-
-        row = cursor.fetchone()
+            row = conn.execute("SELECT kid,key,exp FROM keys WHERE exp>? LIMIT 1", (now,)).fetchone()
         conn.close()
 
-        if row is None:
-            if expired:
-                raise ValueError("No expired keys available")
-            raise ValueError("No unexpired keys available")
-
-        kid, pem, exp = row
-        return self._row_to_keyrecord(kid, pem, exp)
+        return self._row_to_keyrecord(*row)
 
     @classmethod
-    def with_demo_keys(cls, db_file: str = DB_FILE) -> "KeyStore":
-        ks = cls(db_file=db_file)
-        now = ks.now()
-        ks.add_rsa_key(expires_at=now + timedelta(hours=1))
-        ks.add_rsa_key(expires_at=now - timedelta(hours=1))
+    def with_demo_keys(cls):
+        ks = cls()
+        now = datetime.now(timezone.utc)
+        ks.add_rsa_key(now + timedelta(hours=1))
+        ks.add_rsa_key(now - timedelta(hours=1))
         return ks
